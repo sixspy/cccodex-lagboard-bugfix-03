@@ -58,9 +58,14 @@ createApp({
     const token=ref(localStorage.getItem('lagboard_token')||'');
     const user=ref(localStorage.getItem('lagboard_user')||'');
     const username=ref('admin'), password=ref('123456'), err=ref(''), tab=ref(0), actionErr=ref('');
-    const sources=ref([]), arrivals=ref([]), catchups=ref([]);
+    const sources=ref([]), arrivals=ref([]), catchups=ref([]), attempts=ref([]);
+    const water=ref([]), supplement=ref([]), handover=ref({restored:[],contention_count:0,drift_count:0});
     const form=ref({source:'订单源', source_clock:'2026-11-16T10:00:00', ingest_clock:'2026-11-16T10:40:00'});
-    const nav=['到达登记','滞后分级','补齐恢复'];
+    const nav=['到达登记','滞后分级','补齐恢复','审计附页','对账'];
+    const desks=['调度席','补采席'];
+    const desk=ref('调度席');
+    const restoreMsg=ref('');
+    const REV='2026-11-19 · 双成切断卡：甲径已封档';
     const frozen=computed(()=>sources.value.filter(s=>s.output_mode==='冻结').length);
     const degraded=computed(()=>sources.value.filter(s=>s.output_mode==='降级只读').length);
     function modeClass(m){return m==='冻结'?'bad':(m==='降级只读'?'warn':'ok');}
@@ -88,6 +93,14 @@ createApp({
       arrivals.value=Array.isArray(a.items)?a.items:[];
       const c=await loadJson('/api/catchups'); if(c===null) return;
       catchups.value=Array.isArray(c.items)?c.items:[];
+      const au=await loadJson('/api/audit-appendix'); if(au===null) return;
+      attempts.value=Array.isArray(au.items)?au.items:[];
+      const w=await loadJson('/api/water-level-card'); if(w===null) return;
+      water.value=Array.isArray(w.items)?w.items:[];
+      const sp=await loadJson('/api/supplement-list'); if(sp===null) return;
+      supplement.value=Array.isArray(sp.items)?sp.items:[];
+      const ho=await loadJson('/api/handover-card'); if(ho===null) return;
+      handover.value=ho;
       if(sources.value.length && !form.value.source) form.value.source=sources.value[0].name;
     }
     async function recordArrival(){
@@ -96,9 +109,18 @@ createApp({
       const j=await r.json(); actionErr.value=r.ok?(`滞后 ${j.lag_minutes} 分 · ${j.level} · ${j.output_mode}`):(j.detail||'失败');
       await refresh();
     }
-    async function doCatchup(name){await fetch('/api/catchup/'+encodeURIComponent(name),{method:'POST',headers:auth()});await refresh();}
+    async function doCatchup(name){
+      restoreMsg.value='';
+      const r=await fetch('/api/catchup/'+encodeURIComponent(name),{method:'POST',headers:auth(),body:JSON.stringify({desk:desk.value,path:'甲'})});
+      const j=await r.json().catch(()=>({}));
+      if(r.status===409){restoreMsg.value=j.detail||'双成功争用：后交已整笔拒绝';}
+      else if(!r.ok){restoreMsg.value=j.detail||'失败';}
+      else{restoreMsg.value=`唯一成功已封账 · 审计 #${j.audit_id} · 版本 ${j.rev}`;}
+      await refresh();
+    }
+    function outcomeClass(o){return o==='成功'?'ok':(o==='双成功争用'?'warn':'bad');}
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,tab,nav,sources,arrivals,catchups,form,actionErr,frozen,degraded,modeClass,login,logout,recordArrival,doCatchup};
+    return {token,user,username,password,err,tab,nav,sources,arrivals,catchups,attempts,water,supplement,handover,form,actionErr,desk,desks,restoreMsg,REV,outcomeClass,login,logout,recordArrival,doCatchup,frozen,degraded,modeClass};
   },
   template:`
   <div v-if="!token" class="login">
@@ -146,16 +168,49 @@ createApp({
       <div class="card" v-show="tab===1">
         <h3>分级规则</h3>
         <p style="color:#64748b;font-size:13px">≤SLA 正常可写；≤2×SLA 告警降级只读；更久违约冻结。</p>
-        <table><thead><tr><th>源</th><th>SLA</th><th>输出态</th><th></th></tr></thead>
+        <table><thead><tr><th>源</th><th>SLA</th><th>输出态</th><th>版本</th></tr></thead>
         <tbody><tr v-for="s in sources" :key="'g'+s.id">
-          <td>{{s.name}}</td><td>{{s.sla_minutes}}</td><td>{{s.output_mode}}</td>
-          <td><button class="ghost" @click="doCatchup(s.name)">补齐恢复</button></td>
+          <td>{{s.name}}</td><td>{{s.sla_minutes}}</td><td>{{s.output_mode}}</td><td>{{s.rev}}</td>
         </tr></tbody></table>
       </div>
       <div class="card" v-show="tab===2">
-        <h3>补齐记录</h3>
-        <table><thead><tr><th>源</th><th>状态</th><th>恢复为</th><th>时间</th></tr></thead>
-        <tbody><tr v-for="x in catchups" :key="x.id"><td>{{x.source}}</td><td>{{x.status}}</td><td>{{x.restored_mode}}</td><td>{{x.created_at}}</td></tr></tbody></table>
+        <h3 style="margin-bottom:4px">同源恢复 · 唯一成功切断</h3>
+        <p style="color:#64748b;font-size:13px;margin:0 0 10px">{{REV}}。甲径恢复加锁，同源只允许一次成功；第二次整笔拒绝并保留首次审计。</p>
+        <label style="font-size:12px;color:#64748b">值班席</label>
+        <select v-model="desk" style="max-width:200px"><option v-for="d in desks" :value="d">{{d}}</option></select>
+        <table><thead><tr><th>源</th><th>SLA</th><th>输出态</th><th>版本</th><th></th></tr></thead>
+        <tbody><tr v-for="s in sources" :key="'r'+s.id">
+          <td>{{s.name}}</td><td>{{s.sla_minutes}}</td><td>{{s.output_mode}}</td><td>{{s.rev}}</td>
+          <td><button class="ghost" @click="doCatchup(s.name)">补齐恢复（甲径）</button></td>
+        </tr></tbody></table>
+        <div class="err">{{restoreMsg}}</div>
+        <h3 style="margin:14px 0 6px">补齐记录（只留一次成功）</h3>
+        <table><thead><tr><th>源</th><th>状态</th><th>恢复为</th><th>值班席</th><th>版本</th><th>时间</th></tr></thead>
+        <tbody><tr v-for="x in catchups" :key="x.id"><td>{{x.source}}</td><td>{{x.status}}</td><td>{{x.restored_mode}}</td><td>{{x.desk}}</td><td>{{x.rev}}</td><td>{{x.created_at}}</td></tr></tbody></table>
+      </div>
+      <div class="card" v-show="tab===3">
+        <h3 style="margin-bottom:8px">审计附页</h3>
+        <p style="color:#64748b;font-size:13px;margin:0 0 8px">成功、双成功争用、双成偏了三类留痕；同一源同一版本成功只出现一次。</p>
+        <table><thead><tr><th>源</th><th>版本</th><th>结果</th><th>值班席</th><th>路径</th><th>说明</th><th>时间</th></tr></thead>
+        <tbody><tr v-for="a in attempts" :key="a.id">
+          <td>{{a.source}}</td><td>{{a.rev}}</td>
+          <td><span class="mode" :class="outcomeClass(a.outcome)">{{a.outcome}}</span></td>
+          <td>{{a.desk}}</td><td>{{a.path}}</td><td>{{a.reason}}</td><td>{{a.created_at}}</td>
+        </tr></tbody></table>
+      </div>
+      <div class="card" v-show="tab===4">
+        <h3 style="margin-bottom:8px">五处对账 · 只认一次成功</h3>
+        <p style="color:#64748b;font-size:13px;margin:0 0 10px">水位卡片、补采列表、交接卡与审计附页、源目录同源同版本只出现一次成功。</p>
+        <h3 style="font-size:13px">水位卡片</h3>
+        <table><thead><tr><th>源</th><th>输出态</th><th>版本</th><th>恢复成功次数</th></tr></thead>
+        <tbody><tr v-for="w in water" :key="'w'+w.source"><td>{{w.source}}</td><td>{{w.output_mode}}</td><td>{{w.rev}}</td><td>{{w.restore_success_count}}</td></tr></tbody></table>
+        <h3 style="font-size:13px;margin-top:12px">补采列表</h3>
+        <table><thead><tr><th>源</th><th>状态</th><th>值班席</th><th>版本</th></tr></thead>
+        <tbody><tr v-for="x in supplement" :key="'sp'+x.id"><td>{{x.source}}</td><td>{{x.status}}</td><td>{{x.desk}}</td><td>{{x.rev}}</td></tr></tbody></table>
+        <h3 style="font-size:13px;margin-top:12px">交接卡</h3>
+        <p style="color:#64748b;font-size:12px;margin:0">争用留痕 {{handover.contention_count}} 条 · 偏卡 {{handover.drift_count}} 条（不计入成功）</p>
+        <table><thead><tr><th>源</th><th>状态</th><th>值班席</th><th>版本</th><th>时间</th></tr></thead>
+        <tbody><tr v-for="x in handover.restored" :key="'ho'+x.id"><td>{{x.source}}</td><td>{{x.status}}</td><td>{{x.desk}}</td><td>{{x.rev}}</td><td>{{x.created_at}}</td></tr></tbody></table>
       </div>
     </main>
   </div>`
